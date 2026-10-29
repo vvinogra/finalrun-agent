@@ -19,6 +19,7 @@ import { DeviceNode } from '@finalrun/device-node';
 import {
   TestExecutor,
   AIAgent,
+  type LLMTransport,
   type TestRecordingResult,
 } from '@finalrun/goal-executor';
 import type { TestExecutionResult } from '@finalrun/goal-executor';
@@ -61,6 +62,8 @@ export interface TestSessionConfig {
   apiKeys: Record<string, string>;
   defaults: ModelDefaults;
   features?: FeatureOverrides;
+  /** Replaces provider API calls; see LLMTransport. */
+  llmTransport?: LLMTransport;
   maxIterations?: number;
   debug?: boolean;
   platform?: string;
@@ -85,6 +88,8 @@ export interface GoalSessionConfig {
   platform?: string;
   appOverridePath?: string;
   app?: ResolvedAppConfig;
+  /** Overrides dependencies.createSelectionIO() for device selection prompts. */
+  selectionIO?: DeviceSelectionIO;
 }
 
 export interface TestSessionDeps {
@@ -145,7 +150,7 @@ export async function prepareTestSession(
   Logger.i('Detecting local devices...');
   const adbPath = await filePathUtil.getADBPath();
   const deviceNode = dependencies.getDeviceNode();
-  const selectionIO = dependencies.createSelectionIO();
+  const selectionIO = config.selectionIO ?? dependencies.createSelectionIO();
   deviceNode.init(filePathUtil);
   let cleanedUp = false;
 
@@ -458,6 +463,7 @@ function createSessionExecutor(
     // Enables AIAgent's prompt-path secret redaction; omitting this would
     // silently ship prompts with resolved secret values in hierarchy text.
     bindings: config.runtimeBindings,
+    ...(config.llmTransport ? { transport: config.llmTransport } : {}),
   });
 
   return dependencies.createExecutor({

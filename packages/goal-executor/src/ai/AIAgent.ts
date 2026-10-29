@@ -61,6 +61,7 @@ import {
   type LLMTrace,
   type LLMCallTrace,
 } from '../trace.js';
+import type { LLMTransport, LLMUserPart } from './llmTransport.js';
 import { classifyFatalProviderError, FatalProviderError } from './providerFailure.js';
 import { schemaForFeature } from './schemas.js';
 
@@ -136,8 +137,7 @@ export interface GrounderResponse {
 
 type JsonRecord = Record<string, unknown>;
 type LLMPhase = 'planner' | 'grounder';
-/** One part of the user message sent to the LLM. */
-type UserPart = { type: 'text'; text: string } | { type: 'image'; image: string };
+type UserPart = LLMUserPart;
 
 /** Mutable per-call timing context threaded through the attempt-phase helpers. */
 interface LLMCallTimings {
@@ -172,6 +172,15 @@ type AIAgentProviderOptions = {
  * the function itself so we don't import from the transitive `@ai-sdk/provider`.
  */
 type SdkProviderOptions = NonNullable<Parameters<typeof generateText>[0]>['providerOptions'];
+type SdkMessages = ReturnType<AIAgent['_buildLLMMessages']>;
+
+/** One LLM call's result, from the provider SDK or a transport. */
+interface LLMCallResult {
+  output: unknown;
+  text: string;
+  reasoningText?: string;
+  usage?: unknown;
+}
 
 interface ResolvedFeatureConfig {
   provider: string;
@@ -207,6 +216,7 @@ export class AIAgent {
   private _defaults: ModelDefaults;
   private _features: FeatureOverrides;
   private _bindings?: RuntimeBindings;
+  private _transport?: LLMTransport;
 
   private _promptCache: Map<string, string> = new Map();
   // Cached Vercel AI SDK clients, keyed by provider/model
@@ -223,11 +233,17 @@ export class AIAgent {
      * runtime secrets (sessionRunner) must pass them through.
      */
     bindings?: RuntimeBindings;
+    /**
+     * Replaces the provider API call (see llmTransport.ts). When set, no SDK
+     * model is created, so `apiKeys` may be empty.
+     */
+    transport?: LLMTransport;
   }) {
     this._apiKeys = params.apiKeys;
     this._defaults = params.defaults;
     this._features = params.features ?? {};
     this._bindings = params.bindings;
+    this._transport = params.transport;
   }
 
   /**
@@ -675,7 +691,9 @@ export class AIAgent {
   /**
    * Call an LLM via Vercel AI SDK. Uses Output.json() so the provider emits
    * strict JSON (Google response_mime_type, OpenAI response_format, Anthropic
-   * structuredOutputMode), matching the Kotlin backend's behavior.
+   * structuredOutputMode), matching the Kotlin backend's behavior. A
+   * configured transport replaces the SDK call (see _requestCompletion);
+   * tracing, error classification, and logging are shared.
    */
   private async _callLLM(
     systemPrompt: string,
@@ -683,8 +701,6 @@ export class AIAgent {
     feature: FeatureName,
   ): Promise<{ output: unknown; text: string; llmCall: LLMCallTrace }> {
     const resolved = this._resolveFeatureConfig(feature);
-    const model = this._getModel(resolved);
-    const providerOptions = this._getProviderOptions(resolved, feature);
     const phase = phaseForFeature(feature);
 
     // Persist the exact messages we send so we can forward them verbatim to
@@ -701,25 +717,12 @@ export class AIAgent {
     let usage: any;
     let thrownError: unknown;
     try {
-      const result = await generateText({
-        model,
+      const result = await this._requestCompletion({
+        resolved,
+        feature,
+        systemPrompt,
+        userParts,
         messages,
-        // Anthropic has no schema-less JSON mode — the @ai-sdk/anthropic
-        // adapter drops responseFormat silently without a schema, letting
-        // Claude free-write multiple candidate JSONs. Passing a schema routes
-        // the call through Anthropic's tool-use API for enforced structured
-        // output. OpenAI and Google keep their working schema-less paths.
-        output:
-          resolved.provider === 'anthropic'
-            ? Output.object({ schema: schemaForFeature(feature) })
-            : Output.json(),
-        maxOutputTokens: phase === 'planner' ? 8192 : 4096,
-        // The SDK wants `Record<string, JSONObject>`, but its own provider
-        // option types aren't assignable to `JSONObject` (they carry `unknown`
-        // -typed fields — see AIAgentProviderOptions). Everything we build here
-        // is plain JSON, and each provider's options are `satisfies`-checked in
-        // `_getProviderOptions`, so widening at this one boundary is sound.
-        providerOptions: providerOptions as SdkProviderOptions,
       });
       output = result.output;
       text = result.text;
@@ -756,6 +759,55 @@ export class AIAgent {
 
     this._logLLMResponse(feature, resolved, text, reasoningText);
     return { output, text, llmCall };
+  }
+
+  /**
+   * One LLM completion: the configured transport when there is one, otherwise
+   * the Vercel AI SDK call for the resolved provider.
+   */
+  private async _requestCompletion(params: {
+    resolved: ResolvedFeatureConfig;
+    feature: FeatureName;
+    systemPrompt: string;
+    userParts: UserPart[];
+    messages: SdkMessages;
+  }): Promise<LLMCallResult> {
+    const { resolved, feature } = params;
+    if (this._transport) {
+      return this._transport.complete({
+        feature,
+        systemPrompt: params.systemPrompt,
+        userParts: params.userParts,
+        schema: schemaForFeature(feature),
+      });
+    }
+
+    const result = await generateText({
+      model: this._getModel(resolved),
+      messages: params.messages,
+      // Anthropic has no schema-less JSON mode — the @ai-sdk/anthropic
+      // adapter drops responseFormat silently without a schema, letting
+      // Claude free-write multiple candidate JSONs. Passing a schema routes
+      // the call through Anthropic's tool-use API for enforced structured
+      // output. OpenAI and Google keep their working schema-less paths.
+      output:
+        resolved.provider === 'anthropic'
+          ? Output.object({ schema: schemaForFeature(feature) })
+          : Output.json(),
+      maxOutputTokens: phaseForFeature(feature) === 'planner' ? 8192 : 4096,
+      // The SDK wants `Record<string, JSONObject>`, but its own provider
+      // option types aren't assignable to `JSONObject` (they carry `unknown`
+      // -typed fields — see AIAgentProviderOptions). Everything we build here
+      // is plain JSON, and each provider's options are `satisfies`-checked in
+      // `_getProviderOptions`, so widening at this one boundary is sound.
+      providerOptions: this._getProviderOptions(resolved, feature) as SdkProviderOptions,
+    });
+    return {
+      output: result.output,
+      text: result.text,
+      reasoningText: result.reasoningText,
+      usage: result.usage,
+    };
   }
 
   /** Map user parts to SDK message content and pair them with the system prompt. */

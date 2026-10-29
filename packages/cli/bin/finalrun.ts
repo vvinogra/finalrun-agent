@@ -178,6 +178,18 @@ program
     });
   });
 
+program
+  .command('mcp')
+  .description(
+    'Serve FinalRun over MCP (stdio) so an MCP client such as Claude Code acts as its AI — no API key needed',
+  )
+  .action(async () => {
+    await runCommand(async () => {
+      const { runMcpServer } = await import('../src/mcp/server.js');
+      await runMcpServer();
+    });
+  });
+
 const cloud = program
   .command('cloud')
   .description('Run tests on FinalRun cloud devices');

@@ -22,9 +22,16 @@ import {
   formatResolvedAppSummary,
   type ResolvedAppConfig,
 } from '@finalrun/common';
-import { formatDiagnosticsForOutput } from './deviceInventoryPresenter.js';
+import {
+  formatDiagnosticsForOutput,
+  type DeviceSelectionIO,
+} from './deviceInventoryPresenter.js';
 import { compileTestObjective } from './testCompiler.js';
-import type { ExecutionStatus, TestExecutionResult } from '@finalrun/goal-executor';
+import type {
+  ExecutionStatus,
+  LLMTransport,
+  TestExecutionResult,
+} from '@finalrun/goal-executor';
 import { runCheck, type CheckRunnerOptions, type CheckRunnerResult } from '@finalrun/common';
 import { ReportWriter } from './reportWriter.js';
 import { rebuildRunIndex } from './runIndex.js';
@@ -47,6 +54,12 @@ export interface TestRunnerOptions extends CheckRunnerOptions {
   maxIterations?: number;
   debug?: boolean;
   invokedCommand?: 'test' | 'suite';
+  /** Replaces provider API calls; see LLMTransport. Used by `finalrun mcp`. */
+  llmTransport?: LLMTransport;
+  /** Aborts the run the way a first SIGINT does, for callers without a terminal. */
+  abortSignal?: AbortSignal;
+  /** Device-selection IO; defaults to the process stdin/stdout. */
+  deviceSelectionIO?: DeviceSelectionIO;
 }
 
 export interface TestRunnerResult {
@@ -132,6 +145,7 @@ export async function runTests(options: TestRunnerOptions): Promise<TestRunnerRe
   const removeSigintListener = testRunnerDependencies.addSigintListener(() =>
     requestRunAbort(ctx),
   );
+  const removeAbortSignalListener = listenForExternalAbort(ctx);
 
   try {
     const { checked, effectiveGoals } = await runValidationPhase(ctx);
@@ -153,6 +167,7 @@ export async function runTests(options: TestRunnerOptions): Promise<TestRunnerRe
     }
   } finally {
     removeSigintListener();
+    removeAbortSignalListener();
     if (ctx.logSink) {
       Logger.removeSink(ctx.logSink);
     }
@@ -194,6 +209,33 @@ function requestRunAbort(ctx: TestRunContext): void {
   ctx.runAborted = true;
   Logger.w('\nReceived SIGINT — aborting run...');
   ctx.runAbortController.abort();
+}
+
+/**
+ * Wire options.abortSignal to the same abort path as a first SIGINT. Unlike
+ * SIGINT there is no second-signal force exit: the caller owns the process.
+ */
+function listenForExternalAbort(ctx: TestRunContext): () => void {
+  const signal = ctx.options.abortSignal;
+  if (!signal) {
+    return () => {};
+  }
+  const onAbort = (): void => {
+    if (ctx.runAborted) {
+      return;
+    }
+    ctx.runAborted = true;
+    Logger.w('Run abort requested — aborting run...');
+    ctx.runAbortController.abort();
+  };
+  if (signal.aborted) {
+    onAbort();
+    return () => {};
+  }
+  signal.addEventListener('abort', onAbort, { once: true });
+  return () => {
+    signal.removeEventListener('abort', onAbort);
+  };
 }
 
 function abortedBeforeExecutionError(): PreExecutionFailureError {
@@ -289,6 +331,7 @@ async function prepareRunSession(
       platform: checked.resolvedApp.platform,
       appOverridePath: checked.appOverride?.appPath,
       app: checked.resolvedApp,
+      ...(ctx.options.deviceSelectionIO ? { selectionIO: ctx.options.deviceSelectionIO } : {}),
     });
   } catch (error) {
     throw toSetupFailure(ctx, error);
@@ -411,6 +454,7 @@ async function executeTestAndRecord(
       apiKeys: ctx.options.apiKeys,
       defaults: ctx.options.defaults,
       features: ctx.options.features,
+      ...(ctx.options.llmTransport ? { llmTransport: ctx.options.llmTransport } : {}),
       maxIterations: ctx.options.maxIterations,
       debug: ctx.options.debug,
       runtimeBindings: checked.environment.bindings,

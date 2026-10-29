@@ -16,6 +16,12 @@ export type { ActionInput, ActionOutput } from './ActionExecutor.js';
 
 export { AIAgent } from './ai/AIAgent.js';
 export type { PlannerRequest, PlannerResponse, GrounderRequest, GrounderResponse } from './ai/AIAgent.js';
+export type {
+  LLMTransport,
+  LLMTransportRequest,
+  LLMTransportResponse,
+  LLMUserPart,
+} from './ai/llmTransport.js';
 
 export { VisualGrounder } from './ai/VisualGrounder.js';
 export type { VisualGroundingResult } from './ai/VisualGrounder.js';

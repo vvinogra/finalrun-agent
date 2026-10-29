@@ -19,6 +19,7 @@ import {
   PlannerRequest,
   PlannerResponse,
 } from '../AIAgent.js';
+import type { LLMTransport, LLMTransportRequest } from '../llmTransport.js';
 import { FatalProviderError } from '../providerFailure.js';
 
 function makeAgent(overrides?: {
@@ -880,4 +881,87 @@ test('AIAgent.ground does NOT retry on FatalProviderError', async () => {
     (error: unknown) => FatalProviderError.isInstance(error),
   );
   assert.equal(mock.callCount(), 1);
+});
+
+// ----------------------------------------------------------------------------
+// LLMTransport — replaces the provider call (used by `finalrun mcp`)
+// ----------------------------------------------------------------------------
+
+function makeTransportAgent(
+  complete: LLMTransport['complete'],
+  bindings?: RuntimeBindings,
+): AIAgent {
+  return new AIAgent({
+    // No API keys and a provider the SDK switch does not know: a transport
+    // must bypass model creation entirely.
+    apiKeys: {},
+    defaults: { provider: 'mcp', modelName: 'test-client' },
+    transport: { complete },
+    ...(bindings !== undefined ? { bindings } : {}),
+  });
+}
+
+test('AIAgent.plan sends the redacted prompt, screenshot, and schema through the transport', async () => {
+  const requests: LLMTransportRequest[] = [];
+  const agent = makeTransportAgent(async (request) => {
+    requests.push(request);
+    return { output: validPlannerOutput, text: JSON.stringify(validPlannerOutput) };
+  }, SECRET_BINDINGS);
+
+  const response = await agent.plan({
+    testObjective: 'Log in',
+    platform: 'android',
+    preActionScreenshot: 'c2NyZWVu',
+    history: `Typed ${SECRET_VALUE} into the password field`,
+  });
+
+  assert.equal(response.act, PLANNER_ACTION_TAP);
+  assert.equal(response.llmCall?.provider, 'mcp');
+  assert.equal(requests.length, 1);
+  const request = requests[0]!;
+  assert.equal(request.feature, FEATURE_PLANNER);
+  assert.ok(request.systemPrompt.length > 0, 'planner system prompt included');
+  assert.deepEqual(request.userParts[0], { type: 'image', image: 'c2NyZWVu' });
+  const textPart = request.userParts[1];
+  assert.equal(textPart?.type, 'text');
+  const text = textPart?.type === 'text' ? textPart.text : '';
+  assert.ok(text.includes('${secrets.PASSWORD}'), 'placeholder present');
+  assert.ok(!text.includes(SECRET_VALUE), 'raw secret absent');
+  assert.ok(request.schema.safeParse(validPlannerOutput.output).success);
+});
+
+test('AIAgent.ground passes the feature schema through the transport', async () => {
+  const requests: LLMTransportRequest[] = [];
+  const agent = makeTransportAgent(async (request) => {
+    requests.push(request);
+    return { output: { index: 1, reason: 'Login button' }, text: '{"index":1}' };
+  });
+
+  const response = await agent.ground({
+    feature: FEATURE_GROUNDER,
+    act: 'Tap Login',
+    hierarchy: hierarchyWithTypedSecret('user'),
+    platform: 'android',
+  });
+
+  assert.equal(response.output['index'], 1);
+  assert.equal(requests[0]!.feature, FEATURE_GROUNDER);
+  assert.ok(requests[0]!.schema.safeParse({ index: 1 }).success);
+  assert.ok(!requests[0]!.schema.safeParse({ action: 'tap' }).success);
+});
+
+test('AIAgent retries a failed transport call like a provider error', async () => {
+  let calls = 0;
+  const agent = makeTransportAgent(async () => {
+    calls += 1;
+    if (calls === 1) {
+      throw new Error('client went away');
+    }
+    return { output: validPlannerOutput, text: '' };
+  });
+
+  const response = await agent.plan({ testObjective: 'test', platform: 'android' });
+
+  assert.equal(response.act, PLANNER_ACTION_TAP);
+  assert.equal(calls, 2);
 });

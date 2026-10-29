@@ -1225,6 +1225,72 @@ test('runTests aborts the batch after SIGINT and marks the active run as aborted
   }
 });
 
+test('runTests forwards the LLM transport and selection IO, and aborts on options.abortSignal', async () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'finalrun-external-abort-'));
+  writeWorkspaceConfig(rootDir);
+  const testsDir = path.join(rootDir, '.finalrun', 'tests');
+  fs.mkdirSync(testsDir, { recursive: true });
+  for (const name of ['first', 'second']) {
+    fs.writeFileSync(
+      path.join(testsDir, `${name}.yaml`),
+      [`name: ${name}`, 'steps:', `  - Open ${name} flow.`].join('\n'),
+      'utf-8',
+    );
+  }
+
+  const originalPrepareTestSession = testRunnerDependencies.prepareTestSession;
+  const originalExecuteTestOnSession = testRunnerDependencies.executeTestOnSession;
+  const abortController = new AbortController();
+  const llmTransport = {
+    complete: async () => ({ output: {}, text: '{}' }),
+  };
+  const deviceSelectionIO = {
+    input: process.stdin,
+    output: process.stderr,
+    isTTY: false,
+  };
+  const executedCases: string[] = [];
+  let receivedSelectionIO: unknown;
+
+  testRunnerDependencies.prepareTestSession = async (config) => {
+    receivedSelectionIO = config.selectionIO;
+    return createTestSession();
+  };
+  testRunnerDependencies.executeTestOnSession = async (_session, config) => {
+    executedCases.push(config.recording?.testId ?? 'unknown');
+    assert.equal(config.llmTransport, llmTransport);
+    abortController.abort();
+    assert.equal(config.abortSignal?.aborted, true);
+    return createTestExecutionResult({
+      success: false,
+      status: 'aborted',
+      message: 'Goal execution was aborted',
+      totalIterations: 0,
+      steps: [],
+    });
+  };
+
+  try {
+    const result = await runTests({
+      cwd: rootDir,
+      selectors: ['first.yaml', 'second.yaml'],
+      apiKeys: {},
+      defaults: { provider: 'mcp', modelName: 'test-client' },
+      llmTransport,
+      abortSignal: abortController.signal,
+      deviceSelectionIO,
+    });
+
+    assert.equal(receivedSelectionIO, deviceSelectionIO);
+    assert.equal(result.status, 'aborted');
+    assert.deepEqual(executedCases, ['first']);
+  } finally {
+    testRunnerDependencies.prepareTestSession = originalPrepareTestSession;
+    testRunnerDependencies.executeTestOnSession = originalExecuteTestOnSession;
+    await fsp.rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test('runTests requests a forced exit after a second SIGINT', async () => {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'finalrun-shared-session-force-exit-'));
   writeWorkspaceConfig(rootDir);
